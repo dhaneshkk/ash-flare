@@ -106,6 +106,9 @@ impl<W: Worker> fmt::Debug for WorkerSpec<W> {
 pub(crate) struct WorkerProcess<W: Worker> {
     pub spec: WorkerSpec<W>,
     pub handle: Option<JoinHandle<()>>,
+    /// Incarnation number, unique within the owning supervisor. Termination
+    /// reports carry it so reports from replaced instances can be ignored.
+    pub generation: u64,
     /// Triggers cooperative shutdown; dropping it also releases the worker.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
@@ -115,11 +118,12 @@ impl<W: Worker> WorkerProcess<W> {
         spec: WorkerSpec<W>,
         supervisor_name: String,
         control_tx: mpsc::UnboundedSender<Cmd>,
+        generation: u64,
     ) -> Self
     where
         Cmd: From<WorkerTermination> + Send + 'static,
     {
-        Self::spawn_inner(spec, supervisor_name, control_tx, None)
+        Self::spawn_inner(spec, supervisor_name, control_tx, generation, None)
     }
 
     /// Spawns a worker with linked initialization handshake
@@ -127,18 +131,20 @@ impl<W: Worker> WorkerProcess<W> {
         spec: WorkerSpec<W>,
         supervisor_name: String,
         control_tx: mpsc::UnboundedSender<Cmd>,
+        generation: u64,
         init_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     ) -> Self
     where
         Cmd: From<WorkerTermination> + Send + 'static,
     {
-        Self::spawn_inner(spec, supervisor_name, control_tx, Some(init_tx))
+        Self::spawn_inner(spec, supervisor_name, control_tx, generation, Some(init_tx))
     }
 
     fn spawn_inner<Cmd>(
         spec: WorkerSpec<W>,
         supervisor_name: String,
         control_tx: mpsc::UnboundedSender<Cmd>,
+        generation: u64,
         init_tx: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> Self
     where
@@ -153,6 +159,7 @@ impl<W: Worker> WorkerProcess<W> {
             run_worker(
                 supervisor_name,
                 worker_id,
+                generation,
                 worker,
                 control_tx,
                 init_tx,
@@ -164,6 +171,7 @@ impl<W: Worker> WorkerProcess<W> {
         Self {
             spec,
             handle: Some(handle),
+            generation,
             shutdown_tx,
         }
     }

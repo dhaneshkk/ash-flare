@@ -3,6 +3,11 @@
 use crate::restart::{BackoffTracker, RestartPolicy, RestartStrategy, RestartTracker};
 use crate::types::{ChildExitReason, ChildId, ShutdownSignal};
 use crate::worker::Worker;
+use std::any::Any;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -350,10 +355,59 @@ mod tests {
     }
 }
 
+/// How a linked child's initialization ended.
+#[derive(Debug)]
+pub(crate) enum LinkedInit {
+    /// `initialize` succeeded.
+    Ready,
+    /// `initialize` returned an error or panicked.
+    Failed(String),
+    /// The worker task went away without reporting.
+    Vanished,
+    /// `initialize` did not finish within the requested timeout.
+    TimedOut(std::time::Duration),
+}
+
 /// Message sent when a worker terminates
 pub(crate) struct WorkerTermination {
     pub id: ChildId,
     pub reason: ChildExitReason,
+    /// Which incarnation of the child terminated. A supervisor compares it with
+    /// the incarnation it currently runs under `id`, so a late report from an
+    /// instance that has already been replaced cannot trigger a second restart.
+    pub generation: u64,
+}
+
+/// Polls a future and turns a panic inside it into an `Err` carrying the panic
+/// message, instead of unwinding (and silently killing) the worker's task.
+///
+/// Without this a worker that panics never reports its termination: the
+/// supervisor keeps it in its children list as if it were running and never
+/// applies its restart policy.
+pub(crate) struct CatchUnwind<F>(pub(crate) F);
+
+impl<F: Future + Unpin> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, String>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = &mut self.get_mut().0;
+        match std::panic::catch_unwind(AssertUnwindSafe(|| Pin::new(&mut *inner).poll(cx))) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => Poll::Ready(Err(panic_message(payload.as_ref()))),
+        }
+    }
+}
+
+/// Extracts the message from a panic payload.
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
 }
 
 /// Runs a worker with initialization, execution, and shutdown lifecycle
@@ -361,9 +415,14 @@ pub(crate) struct WorkerTermination {
 /// When `shutdown` is triggered the worker's `run` future is dropped at its next
 /// await point, but `shutdown` is still awaited so cleanup runs. This is what
 /// makes graceful termination different from aborting the task outright.
+///
+/// A panic in `initialize` or `run` is caught and reported as an abnormal exit,
+/// so the supervisor applies the child's restart policy exactly as it would for
+/// a returned error. A panic in the `shutdown` hook is caught and logged.
 pub(crate) async fn run_worker<W: Worker, Cmd>(
     supervisor_name: String,
     worker_id: ChildId,
+    generation: u64,
     mut worker: W,
     control_tx: mpsc::UnboundedSender<Cmd>,
     init_tx: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -372,34 +431,39 @@ pub(crate) async fn run_worker<W: Worker, Cmd>(
     Cmd: From<WorkerTermination>,
 {
     let qualified_name = format!("{supervisor_name}/{worker_id}");
+    let report = |reason: ChildExitReason| {
+        let _send = control_tx.send(
+            WorkerTermination {
+                id: worker_id.clone(),
+                reason,
+                generation,
+            }
+            .into(),
+        );
+    };
 
     // Initialize the worker
-    match worker.initialize().await {
-        Ok(()) => {
-            // Send initialization success confirmation if linked
-            if let Some(tx) = init_tx {
-                let _send = tx.send(Ok(()));
-            }
+    let init_error = match CatchUnwind(worker.initialize()).await {
+        Ok(Ok(())) => None,
+        Ok(Err(err)) => Some(err.to_string()),
+        Err(panic) => Some(format!("worker panicked during initialization: {panic}")),
+    };
+    if let Some(error) = init_error {
+        tracing::error!(
+            worker = %qualified_name,
+            error = %error,
+            "worker initialization failed"
+        );
+        // Send initialization failure if linked
+        if let Some(tx) = init_tx {
+            let _send = tx.send(Err(error));
         }
-        Err(err) => {
-            tracing::error!(
-                worker = %qualified_name,
-                error = %err,
-                "worker initialization failed"
-            );
-            // Send initialization failure if linked
-            if let Some(tx) = init_tx {
-                let _send = tx.send(Err(err.to_string()));
-            }
-            let _send = control_tx.send(
-                WorkerTermination {
-                    id: worker_id,
-                    reason: ChildExitReason::Abnormal,
-                }
-                .into(),
-            );
-            return;
-        }
+        report(ChildExitReason::Abnormal);
+        return;
+    }
+    // Send initialization success confirmation if linked
+    if let Some(tx) = init_tx {
+        let _send = tx.send(Ok(()));
     }
 
     tracing::debug!(worker = %qualified_name, "worker started");
@@ -414,12 +478,12 @@ pub(crate) async fn run_worker<W: Worker, Cmd>(
             tracing::debug!(worker = %qualified_name, "worker shutdown requested");
             ChildExitReason::Shutdown
         }
-        result = worker.run() => match result {
-            Ok(()) => {
+        result = CatchUnwind(worker.run()) => match result {
+            Ok(Ok(())) => {
                 tracing::debug!(worker = %qualified_name, "worker completed normally");
                 ChildExitReason::Normal
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 tracing::warn!(
                     worker = %qualified_name,
                     error = %err,
@@ -427,26 +491,38 @@ pub(crate) async fn run_worker<W: Worker, Cmd>(
                 );
                 ChildExitReason::Abnormal
             }
+            Err(panic) => {
+                tracing::error!(
+                    worker = %qualified_name,
+                    panic = %panic,
+                    "worker panicked"
+                );
+                ChildExitReason::Abnormal
+            }
         },
     };
 
     // Shutdown the worker
-    if let Err(err) = worker.shutdown().await {
-        tracing::error!(
-            worker = %qualified_name,
-            error = %err,
-            "worker shutdown failed"
-        );
+    match CatchUnwind(worker.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::error!(
+                worker = %qualified_name,
+                error = %err,
+                "worker shutdown failed"
+            );
+        }
+        Err(panic) => {
+            tracing::error!(
+                worker = %qualified_name,
+                panic = %panic,
+                "worker shutdown hook panicked"
+            );
+        }
     }
 
     tracing::debug!(worker = %qualified_name, "worker stopped");
 
     // Notify supervisor of termination
-    let _send = control_tx.send(
-        WorkerTermination {
-            id: worker_id,
-            reason: exit_reason,
-        }
-        .into(),
-    );
+    report(exit_reason);
 }

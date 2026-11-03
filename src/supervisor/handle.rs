@@ -7,12 +7,15 @@ use crate::restart::RestartPolicy;
 use crate::types::{ChildId, ChildInfo};
 use crate::worker::{Worker, WorkerSpec};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Handle used to interact with a running supervisor tree.
 pub struct SupervisorHandle<W: Worker> {
     pub(crate) name: Arc<String>,
     pub(crate) control_tx: mpsc::UnboundedSender<SupervisorCommand<W>>,
+    /// Becomes `true` once the supervisor task has finished, i.e. after every
+    /// child has been stopped and its `shutdown` hook has run (or timed out).
+    pub(crate) stopped: watch::Receiver<bool>,
 }
 
 // Hand-written so cloning a handle does not require the worker itself to be
@@ -22,6 +25,7 @@ impl<W: Worker> Clone for SupervisorHandle<W> {
         Self {
             name: Arc::clone(&self.name),
             control_tx: self.control_tx.clone(),
+            stopped: self.stopped.clone(),
         }
     }
 }
@@ -41,15 +45,17 @@ impl<W: Worker> SupervisorHandle<W> {
     pub(crate) fn start_supervised(
         spec: SupervisorSpec<W>,
         parent_tx: mpsc::UnboundedSender<SupervisorCommand<W>>,
+        generation: u64,
     ) -> Self {
-        Self::start_inner(spec, Some(parent_tx))
+        Self::start_inner(spec, Some((parent_tx, generation)))
     }
 
     fn start_inner(
         spec: SupervisorSpec<W>,
-        parent_tx: Option<mpsc::UnboundedSender<SupervisorCommand<W>>>,
+        parent: Option<(mpsc::UnboundedSender<SupervisorCommand<W>>, u64)>,
     ) -> Self {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (stopped_tx, stopped) = watch::channel(false);
         let name_arc = Arc::new(spec.name.clone());
         let runtime = SupervisorRuntime::new(spec, control_rx, control_tx.clone());
 
@@ -60,17 +66,20 @@ impl<W: Worker> SupervisorHandle<W> {
 
             // A `Shutdown` reason is the parent's own doing and is ignored there;
             // an abnormal exit is what makes the parent restart this subtree.
-            if let Some(tx) = parent_tx {
+            if let Some((tx, generation)) = parent {
                 let _send = tx.send(SupervisorCommand::ChildTerminated {
                     id: (*runtime_name).clone(),
                     reason,
+                    generation,
                 });
             }
+            stopped_tx.send_replace(true);
         });
 
         Self {
             name: name_arc,
             control_tx,
+            stopped,
         }
     }
 
@@ -220,17 +229,31 @@ impl<W: Worker> SupervisorHandle<W> {
             .map_err(|_| SupervisorError::ShuttingDown(self.name().to_owned()))?
     }
 
-    /// Requests a graceful shutdown of the supervisor tree.
+    /// Shuts the supervisor tree down gracefully and waits until it has stopped.
+    ///
+    /// Children are stopped in reverse start order, as in OTP. Each worker is
+    /// asked to stop and given the shutdown timeout to finish, including its
+    /// `shutdown` hook, before it is aborted. When this returns, every child has
+    /// stopped, so it is safe to exit the process.
     ///
     /// # Errors
     ///
-    /// Returns an error if the supervisor channel is already closed.
-    #[allow(clippy::unused_async)]
+    /// Returns an error if the supervisor had already stopped before the call.
     pub async fn shutdown(&self) -> Result<(), SupervisorError> {
         self.control_tx
             .send(SupervisorCommand::Shutdown)
             .map_err(|_| SupervisorError::ShuttingDown(self.name().to_owned()))?;
+        self.wait_stopped().await;
         Ok(())
+    }
+
+    /// Waits until the supervisor task has finished, whether it was shut down
+    /// or stopped because its restart intensity was exceeded.
+    pub async fn wait_stopped(&self) {
+        let mut stopped_rx = self.stopped.clone();
+        // An error means the sender is gone, which only happens once the
+        // supervisor task has ended: it is stopped either way.
+        let _stopped = stopped_rx.wait_for(|has_stopped| *has_stopped).await;
     }
 
     /// Returns the supervisor's name.

@@ -13,6 +13,9 @@ pub(crate) enum Child<W: Worker> {
     Supervisor {
         handle: SupervisorHandle<W>,
         spec: Arc<SupervisorSpec<W>>,
+        /// Incarnation number of this nested supervisor; see
+        /// [`WorkerProcess::generation`](crate::worker::WorkerProcess).
+        generation: u64,
     },
 }
 
@@ -22,6 +25,15 @@ impl<W: Worker> Child<W> {
         match self {
             Child::Worker(w) => &w.spec.id,
             Child::Supervisor { spec, .. } => &spec.name,
+        }
+    }
+
+    /// Incarnation number of the currently running instance of this child.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        match self {
+            Child::Worker(w) => w.generation,
+            Child::Supervisor { generation, .. } => *generation,
         }
     }
 
@@ -60,6 +72,8 @@ impl<W: Worker> Child<W> {
                 let _graceful = w.stop(timeout).await;
             }
             Child::Supervisor { handle, .. } => {
+                // Waits until the nested tree has fully stopped, so a restart
+                // never runs the old and the new subtree side by side.
                 let _shutdown_result = handle.shutdown().await;
             }
         }
